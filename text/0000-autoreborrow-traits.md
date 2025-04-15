@@ -399,7 +399,15 @@ trait ReborrowMut<'a> {
 ```
 
 The compiler would then automatically implement the type conversion between
-`Self` and `Target` using a transmute (with at least basic validity checks?).
+`Self` and `Target` using a transmute (with at least basic validity checks?). If
+the compiler cannot perform such a transmute safely, the traits could be marked
+unsafe with a requirement for `Self` and `Target` to be bitwise-compatible with
+one another. Usually this would mean that the two types are the same, or they
+are both `repr(transparent)` of the same primitive type, or they are both
+`repr(C)` with the same fields. For `ReborrowMut` specifically it might even be
+a worthwhile change to remove the `Target` GAT entirely and only support
+exclusive reborrowing into `Self`.
+
 Alternatively, a type bound of `Target: From<Self>` could be placed on the GAT
 which the compiler could then use to perform the type conversion. The downside
 here would of course be that this would again be user-controlled code, but the
