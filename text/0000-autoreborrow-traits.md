@@ -111,7 +111,8 @@ fn branching_function(source: &mut T) -> Result<&U, &Y> {
     // to the source lifetime, ie. to the end of the call. The mutate call
     // later requires the Ok value's lifetime to end before that call. The
     // compiler is currently not smart enough to split Ok and Err from one
-    // another, meaning that this CANNOT be done today.
+    // another, meaning that this does not work in current stable Rust.
+    // However, this does compile on Polonius!
     let result = result_function(source)?;
     println!("Example: {:?}", result);
     source.mutate()
@@ -191,7 +192,9 @@ The important thing to note here is that while manual unwrapping and rewrapping
 of an Option does help through many issues, it too fails in the branching
 function returns case, though it gives a different error: the error is now
 related to the lack of true reborrowing as opposed to the compiler not knowing
-how to split Ok and Err branch lifetimes from one another.
+how to split Ok and Err branch lifetimes from one another. Even Polonius does
+not help in this case, as the `source.as_ref()` call has effectively ruined the
+reference lifetime in a reborrowing sense.
 
 ## Automatic reborrowing of custom reference types
 
