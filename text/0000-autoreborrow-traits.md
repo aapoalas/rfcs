@@ -127,7 +127,8 @@ The important things to note here are:
 3. If the function being called returns a value derived from the reborrowed
    reference, the returned value's lifetime extends in the caller's scope to
    match the original reference's lifetime.
-4. Branching function returns run into issues with lifetime extension.
+4. Branching function returns run into issues with lifetime extension that needs
+   Polonius to resolve.
 
 ## Automatic wrapper type reborrowing
 
