@@ -31,10 +31,6 @@ Examples of features unlocked by this RFC are:
 - Returning of values deriving from reborrowed parameters, extending to the
   source lifetime.
 
-# Guide-level explanation
-
-[guide-level-explanation]: #guide-level-explanation
-
 A _reborrow_ is a bitwise _copy_ of a type with extra lifetime analysis
 performed by the compiler. The lifetime of the reborrow result is a subset of
 the source value's lifetime (not a strict subset, the result's lifetime is
@@ -472,94 +468,589 @@ cxx is interested in automatic coercion between the different C++ reference
 types. Since these are pointer wrapping types, some forms of autoreborrowing
 would make these coercions possible.
 
+# Guide-level explanation
+
+[guide-level-explanation]: #guide-level-explanation
+
+When creating a custom exclusive reference types, users can derive a `Reborrow`
+trait on the type which opts the type in to `&mut` like semantics. The trait
+checks that all of the fields of the type implement `Reborrow` and return false
+for `needs_drop`. The trait has no methods and no parameter or associated types.
+A blanket implementation of `Reborrow` for `Copy` types is provided by the
+`core` library.
+
+For coercing a custom exclusive reference type into a shared reference type,
+users can implement a `CoerceShared: Reborrow` trait on the custom exclusive
+reference type. The trait is simple and only requires specifying the `Target`
+type:
+
+```rust
+trait CoerceShared: Reborrow {
+    type Target: Copy;
+}
+```
+
+The `Copy` bound on `Target` ensures that all shared reference types are always
+trivially copyable. The trait checks that for all fields in `T::Target`, a field
+with the same name exists in `T` such that type `Field` of the field in `T`
+implements is `Field: CoerceShared` where the type `SharedField` of the field in
+`T::Target` is equal to the type `<Field as CoerceShared>::Target`. A blanket
+implementation of `CoerceShared<Target = Self>` for `Copy` types is provided by
+the `core` library.
+
+When a value `T: Reborrow` is used at a coercion site expecting `T`, a new `T`
+is created from the original value using the functional record update syntax and
+the original value is disabled for reads and writes. The original value stays
+disabled for writes until all fields of `T` that are `Reborrow` but not `Copy`
+are dropped, and stays disabled for reads until all fields of `T` that are
+`Copy` and carry a lifetime are dropped. This is considered a write on the
+original value.
+
+When a value `T: CoerceShared<Target = U>` is used at a coercion site expecting
+`U`, a new `U` is created from the original value with each field in `U`
+performing an implied `CoerceShared` method on a copy of the corresponding field
+in `T`. The original value stays disabled for writes until all fields of `U`
+that are `Copy` and carry a lifetime are dropped. This is considered a read on
+the original value.
+
+## Custom exclusive to shared reference type method resolution
+
+Implementing `T: CoerceShared<Target = U>` makes it possible to call methods of
+`U` on `T`. For example, for a type
+`MyMut<'a, T>: Reborrow + CoerceShared<Target = MyRef<'a, T>>` with a method
+
+```rust
+impl<'a, T> MyRef<'a, T> {
+    fn get(self) -> &'a T;
+}
+```
+
+it is possible to call this directly on a value of type `T`:
+
+```rust
+fn example<T>(t: MyMut<T>) {
+    let data: &T = t.get();
+}
+```
+
+This implicitly applies `CoerceShared` on `MyMut<'a, T>` to create a
+`MyRef<'a, T>` and finds the `get` method on that type.
+
+## Building custom reference types
+
+A basic custom exclusive reference type is as follows:
+
+```rust
+struct MyMut<'a, T> {
+    ptr: NonNull<T>,
+    lifetime: PhantomData<&'a ()>,
+}
+```
+
+The `MyMut` struct does not derive `Copy` and thus requires a `Reborrow`
+implementation. When `MyMut<T>` is reborrowed, the compiler translates
+
+```rust
+fn inner_mut(source: MyMut<T>);
+
+fn outer_mut(source: MyMut<T>) {
+    inner_mut(source);
+}
+```
+
+into something akin to
+
+```rust
+fn inner_mut(source: MyMut<T>);
+
+fn outer_mut(source: MyMut<T>) {
+    let MyMut {
+        ptr,
+        lifetime,
+    } = source;
+    inner_mut(MyMut {
+        ptr,
+        lifetime,
+    })
+}
+```
+
+where the original `source` is marked used as exclusive by the compiler for the
+lifetime of the resulting `MyMut`, similarly to how it would work if `lifetime`
+was a `&mut` reference.
+
+The corresponding custom shared reference type for `MyMut` is as follows:
+
+```rust
+#[derive(Clone, Copy)]
+struct MyRef<'a, T> {
+    ptr: NonNull<T>,
+    lifetime: PhantomData<&'a ()>,
+}
+```
+
+and using `CoerceShared` to convert a `MyMut` into a `MyRef` is translated into
+something akin to
+
+```rust
+fn inner_ref(source: MyRef<T>);
+
+fn outer_ref(source: MyMut<T>) {
+    let MyMut {
+        ptr,
+        lifetime,
+    } = source;
+    inner_ref(MyRef {
+        ptr,
+        lifetime,
+    })
+}
+```
+
+where the original `source` is marked used as shared for the lifetime of the
+`MyRef`.
+
+## Automatic reborrowing of structs with multiple fields
+
+The field-wise definition of `Reborrow` and `CoerceShared` traits enables
+automatic reborrowing of structs that have multiple fields and even multiple
+lifetimes with different reference semantics associated with them.
+
+A basic example, simplified from `faer`'s reborrowing use case, with a single
+lifetime and multiple data fields is given below.
+
+```rust
+struct MatMut<'a, T> {
+    ptr: NonNull<T>,
+    rows: usize,
+    cols: usize,
+    row_stride: usize,
+    col_stride: usize,
+    __marker: PhantomData<&'a ()>,
+}
+
+#[derive(Clone, Copy)]
+struct MatRef<'a, T> {
+    ptr: NonNull<T>,
+    rows: usize,
+    cols: usize,
+    row_stride: usize,
+    col_stride: usize,
+    __marker: PhantomData<&'a ()>,
+}
+
+fn inner_mut(source: MatMut<T>);
+
+fn outer_mut(source: MatMut<T>) {
+    // inner_mut(source); is turned by the compiler into:
+    let MatMut {
+        ptr,
+        rows,
+        cols,
+        row_stride,
+        col_stride,
+        __marker,
+    } = source;
+    inner_mut(MatMut {
+        ptr,
+        rows,
+        cols,
+        row_stride,
+        col_stride,
+        __marker,
+    })
+}
+
+fn inner_ref(source: MatRef<T>);
+
+fn outer_ref(source: MatMut<T>) {
+    // inner_ref(source); is turned by the compiler into:
+    let MatMut {
+        ptr,
+        rows,
+        cols,
+        row_stride,
+        col_stride,
+        __marker,
+    } = source;
+    inner_ref(MatRef {
+        ptr,
+        rows,
+        cols,
+        row_stride,
+        col_stride,
+        __marker,
+    })
+}
+```
+
+It is also possible for the `CoerceShared::Target` type to have a different
+layout than the source type does. An example described by a user in their closed
+source code base is given below.
+
+```rust
+struct ImbrisMut<'a, T> {
+    ptr: NonNull<T>,
+    metadata: usize,
+    __marker: PhantomData<&'a ()>,
+}
+
+#[derive(Clone, Copy)]
+struct ImbrisRef<'a, T> {
+    ptr: NonNull<T>,
+    __marker: PhantomData<&'a ()>,
+}
+
+fn inner_mut(source: ImbrisMut<T>);
+
+fn outer_mut(source: ImbrisMut<T>) {
+    // inner_mut(source); is turned by the compiler into:
+    let ImbrisMut {
+        ptr,
+        metadata,
+        __marker,
+    } = source;
+    inner_mut(ImbrisMut {
+        ptr,
+        metadata,
+        __marker,
+    })
+}
+
+fn inner_ref(source: ImbrisRef<T>);
+
+fn outer_ref(source: ImbrisMut<T>) {
+    // inner_ref(source); is turned by the compiler into:
+    let ImbrisMut {
+        ptr,
+        metadata,
+        __marker,
+    } = source;
+    inner_ref(ImbrisRef {
+        ptr,
+        __marker,
+    })
+}
+```
+
+It is also possible for there to be multiple lifetimes in the type with some of
+those using exclusive reference semantics and others using shared reference
+semantics. The reborrowing structure can also have multiple levels of depth. An
+example from the Nova JavaScript engine's `GcScope` is given below.
+
+```rust
+struct GcMut<'a> {
+    __marker: PhantomData<&'a mut GcToken>,
+}
+
+
+#[derive(Clone, Copy)]
+struct GcRef<'a> {
+    __marker: PhantomData<&'a mut GcToken>,
+}
+
+#[derive(Clone, Copy)]
+struct ScopeRef<'a> {
+    __marker: PhantomData<&'a ScopeToken>,
+}
+
+struct GcScope<'a, 'b> {
+    gc: GcMut<'a>,
+    scope: ScopeRef<'b>,
+}
+
+struct NoGcScope<'a, 'b> {
+    gc: GcRef<'a>,
+    scope: ScopeRef<'b>,
+}
+
+fn inner_mut(source: GcScope<'a, 'b>);
+
+fn outer_mut(source: GcScope<'a, 'b>) {
+    // inner_mut(source); is turned by the compiler into:
+    let GcScope {
+        gc,
+        scope,
+    } = source;
+    let GcMut {
+        __marker,
+    } = gc;
+    inner_mut(GcScope {
+        gc: GcMut {
+            __marker,
+        },
+        scope,
+    })
+}
+
+fn inner_ref(source: NoGcScope<'a, 'b>);
+
+fn outer_ref(source: GcScope<'a, 'b>) {
+    // inner_ref(source); is turned by the compiler into:
+    let GcScope {
+        gc,
+        scope,
+    } = source;
+    let GcMut {
+        __marker,
+    } = gc;
+    inner_ref(NoGcScope {
+        gc: GcRef {
+            __marker,
+        },
+        scope,
+    })
+}
+```
+
+There is an interesting point here: the `scope` field can effectively be copied
+directly into the resulting `GcScope` or `NoGcScope` in either exclusive or
+shared reborrowing case, as it is `Copy`. Its functional record update syntax
+could be written out but would not make much of a point. The important bit there
+is that the resulting `scope` should not keep the original `source` used at all.
+
+The `gc` field on the other hand needs to keep the `source` used. This is
+achieved by having the compiler mark the `source.gc` field as used, either as
+exclusive for `Reborrow` or as shared for `CoerceShared`, for the lifetime of
+the resulting `GcMut` / `GcRef` type.
+
+### Why recurse into non-Copy reborrowable fields?
+
+In the above `GcScope` example it could be argued that `GcRef` should be
+reborrowed as exclusive by the compiler, without looking into its fields and
+performing the functional record update syntax on it. This would work for
+`GcRef`, and would even be more clear-cut than the destructuring since the code
+"turned by the compiler into", as written above, would effectively compile with
+minor changes (`let GcMut { .. }  = &mut source;`) in today's Rust because all
+fields within `GcRef` are `Copy` but it would not mark the `source` as being
+used.
+
+The reason for recursing becomes clearer if we take a more complicated example.
+Imagine a larger wrapper type with multiple reference-like fields, some of them
+with exclusive reference semantics, some of them with shared reference
+semantics, and some of the containing other wrappers that themselves contain
+exclusive and shared reference semantics.
+
+```rust
+struct Context<'a, 'b, 'c, 'd> {
+    gc: GcScope<'a, 'b>,
+    arena: &'c mut Arena,
+    validity_bool: &'d AtomicBool,
+}
+```
+
+Now if this type was made reborrowable and that reborrowing act only performed
+an exclusive reborrow on `GcScope<'a, 'b>` without looking at its fields, then
+the result would be a new `GcScope` where both of the lifetimes keep the
+original `GcScope` "used".
+
+```rust
+fn outer_mut(source: Context) {
+    let Context {
+        gc,
+        arena,
+        validity_bool,
+    } = source;
+    inner_mut(Context {
+        gc,
+        arena,
+        validity_bool,
+    })
+}
+```
+
+Now if the `'b` lifetime escapes in some `Value<'b>`, that `Value` would keep
+the `gc` field borrowed as exclusive. This is not what the `GcScope` internally
+defines; its internal view of the `'b` lifetime is that it has shared reference
+semantics. This is effectively the same issue that mutating `gc.gc` and reading
+`gc.scope` at the same time is okay, but calling a method on `gc` that mutates
+`self.scope` and reading `gc.scope` at the same time is not okay. In the first
+case, only `gc.gc` is used exclusively and `gc.scope` is used as shared, whereas
+in the latter case the whole `gc` is used exclusively and `gc.scope` is used as
+shared, which is an aliasing violation.
+
+The correct formulation for transitive reborrowing is then this: for each field
+in the reborrowed type that is `!Copy`, recurse into the type and check if it
+has any `!Copy` fields. If it does, recurse into it. If not, then mark that
+field used. An example using `Context` is given below.
+
+```rust
+fn outer_mut(a: Context) {
+    // `Context: !Copy` so recurse.
+    let Context {
+        // `GcScope: !Copy` so recurse.
+        gc,
+        // `Arena: !Copy` but has no fields: mark as used.
+        arena,
+        // `&T: Copy` so skip.
+        validity_bool,
+    } = source;
+    let GcScope {
+        // `GcMut: !Copy` but has no `!Copy` fields: mark as used.
+        gc,
+        // `ScopeRef: Copy` so skip.
+        scope
+    } = gc;
+    let GcRef {
+        __marker,
+    } = gc;
+    inner_mut(Context {
+        gc: GcScope {
+            gc: GcMut {
+                __marker,
+            },
+            scope,
+        },
+        arena,
+        validity_bool,
+    })
+}
+```
+
 # Reference-level explanation
 
 [reference-level-explanation]: #reference-level-explanation
 
-Reborrowing itself should be a fairly direct and "easy-to-grasp" feature in how
-it works; exclusive reference wrappers and custom exclusive reference-like types
-should be able to opt-in to exclusive reference-like reborrowing. This means
-that:
+## `core` libs
 
-1. When such a value of this type is used at a coercion site, the value is
-   implicitly reborrowed as either exclusively or as shared, depending on the
-   target type required by the site.
-2. A copy of the source value is produced and converted into the target type.
-3. Lifetime extension is applied to the reborrowed lifetime as necessary.
-
-A reborrowable type is declared to the compiler using the following methodless
-trait: note that implementing the trait makes a type reborrowable both
-exclusively and as shared, and it is the target type of a coercion site that
-implicitly decides which type of reborrowing is performed.
+Two new traits, `Reborrow` and `CoerceShared`, are added to and exposed from
+`core::ops`.
 
 ```rust
-unsafe trait Reborrow<'a>: !Clone + !Drop {
-    type Ref: Copy;
+pub trait Reborrow {}
+
+pub trait CoerceShared: Reborrow {
+    type Target: Copy;
 }
 ```
 
-Note: the `!Drop` requirement isn't sufficient; reborrowable types must neither
-implement `Drop` or return `true` for `std::mem::needs_drop`; this requirement
-cannot be specified as a trait bound. The `Copy` bound on `Borrow::Ref` is a
-logical result of shared reborrowing: the source type can be reborrowed as
-shared multiple times and each shared reborrow should produce logically
-interchangeable target types (order or number of reborrows should not matter);
-hence reborrowing twice as shared should be equal to reborrowing once as shared
-and copying the result.
-
-The trait would be implemented in the following way:
+A blanket implementation is provided for any type that implements `Copy`:
 
 ```rust
-unsafe impl<'a> Reborrow<'a> for MatMut<'a> {
-    type Ref = MatRef<'a>;
+impl<P: Copy> Reborrow for P {}
+
+impl<P: Copy> CoerceShared for P {
+    type Target = Self;
 }
 ```
 
-or for types with multiple lifetimes:
+The traits are also implemented for `&mut T` and `&T`:
 
 ```rust
-unsafe impl<'a, 'b> Reborrow<'a> for GcScope<'a, 'b> {
-    type Ref = NoGcScope<'a, 'b>;
+impl<T: ?Sized> Reborrow for &mut T {}
+
+impl<T: ?Sized> CoerceShared for &mut T {
+    type Target = &T;
 }
 ```
 
-Implementing `Reborrow<'a> for T<'a> { type Ref; }` means that
+Blanket implementations for `Pin<&mut T>` and `Option<&mut T>` are also added:
 
-1. At coercion sites taking `T` by value, the source `T` is copied via an
-   exclusive reference (exclusive access is asserted) and its `'a` lifetime is
-   replaced with a reborrowed lifetime on which normal lifetime extension rules
-   can be applied. While the result `T` lives, the source `T` is disabled.
-2. At coercion sites taking `T::Ref` by value, the source `T` is copied via a
-   shared reference (shared access is asserted) and the copy converted into
-   `T::Ref`. The `'a` lifetime in `T::Ref`, if found, is replaced with a
-   reborrowed lifetime as above. While the result `T::Ref` lives, the source `T`
-   is disabled for mutations.
+```rust
+impl<T: ?Sized> Reborrow for Pin<&mut T> {}
+
+impl<T: ?Sized> CoerceShared for Pin<&mut T> {
+    type Target = Pin<&T>;
+}
+
+impl<T: ?Sized> Reborrow for Option<&mut T> {}
+
+impl<T: ?Sized> CoerceShared for Option<&mut T> {
+    type Target = Option<&T>;
+}
+```
+
+## Compiler changes: method probing
+
+The existing Rust
+[reference section for method calls describes the algorithm for assembling method call candidates](https://doc.rust-lang.org/reference/expressions/method-call-expr.html),
+and there’s more detail in the
+[rustc dev guide](https://rustc-dev-guide.rust-lang.org/method-lookup.html).
+
+The key part of the first page is this:
+
+> The first step is to build a list of **candidate receiver types**. Obtain
+> these by repeatedly dereferencing the receiver expression’s type, adding each
+> type encountered to the list, then finally attempting an unsized coercion at
+> the end, and adding the result type if that is successful. Then, for each
+> candidate `T`, add `&T` and `&mut T` to the list immediately after `T`.
+
+We add to the "for each candidate `T`" list expansion the step that if
+`T: CoerceShared` where `<T as CoerceShared>::Target` is not equal to `T`, and
+`T` is not equal to some `&mut U` then `<T as CoerceShared>::Target` is added to
+the list immediately after `&mut T`. Note: the condition on `T` not being some
+`&mut U` is because of `&mut T: CoerceShared<Target = &T>`, which would
+otherwise produce unnecessary duplicates.
+
+This does change the list of candidate receiver types, adding shared coercion
+targets to it when applicable. These should be rare, so the effective change is
+minimal.
+
+## Compiler changes: reborrow adjustments
+
+In the compiler, when resolving coercion a new possible reborrow adjustment is
+added. The condition for performing this coercion is that the source type is
+`Reborrow: !Copy` and the target type is equal to the source type, or that the
+source type is `CoerceShared: !Copy` and the target type is equal to the source
+type's `CoerceShared::Target` type. In the first case an exclusive reborrow
+adjustment is inserted, and in the second case a shared reborrow adjustment is
+inserted. This replaces the `PinReborrow` adjustment currently in place for
+`Pin<&mut T>` reborrowing specifically.
+
+This adjustment creates a new target type struct by performing the following
+steps with the source type and the target type as its parameters:
+
+1. Let `should_mark` be `true`.
+2. For each field in the target type, do:
+   1. If the target field type is `Copy` and the corresponding source field type
+      is `Copy`, then
+      1. Assert that the two types are the same.
+      1. Perform a copy from source to target.
+   1. If the target field type is `Copy` and the corresponding source field type
+      is `!Copy`, then
+      1. Assert that the reborrow adjustment kind is "shared".
+      1. Assert that the source field type implements `CoerceShared` and its
+         `CoerceShared::Target` is equal to the target field type.
+      1. Set `should_mark` false.
+      1. Note: marking `should_mark` false is superfluous, we could mark any
+         number of reborrowable source fields used as shared.
+      1. Recursion: perform these steps (starting at the top) with the source
+         field type and the target field type as parameters.
+      1. Note: the recursion is needed for handling changes in memory layout
+         between source and target field types.
+   1. If the target field type is `!Copy` and the corresponding source field
+      type is `!Copy`, then
+      1. Assert that the reborrow adjustment kind is "exclusive".
+      1. Assert that the two types are the same.
+      1. Set `should_mark` false.
+      1. Recursion: perform these steps (starting at the top) with the source
+         field type and the target field type as parameters.
+      1. Note: the recursion is needed for ensuring that only necessary parts of
+         the source type are reborrowed as exclusive.
+3. If `should_mark` is true, then
+   1. If the reborrow adjustment kind is "shared", then
+      1. Mark the the source type used as shared.
+   1. If the reborrow adjustment kind is "exclusive", then
+      1. Mark the source type used as exclusive.
 
 # Drawbacks
 
 [drawbacks]: #drawbacks
 
-The main drawback of autoreborrowing is how to convert the `T` to `T::Ref`: the
-most obvious way to do this would be with an `fn reborrow` method on the
-`Reborrow` trait, but this opens up a world where each coercion site may
-implicitly inject a call to user-code. For this reason the proposed `Reborrow`
-trait lack methods entirely, as we'd prefer for reborrowing to be devoid of any
-user-code. But if user-code is not involved in the conversion, then the compiler
-is forced to perform the conversion on its own.
+The main drawback of autoreborrow traits is the conversion from the `T` to
+`<T as CoerceShared>::Target` and the related addition to method probing logic.
+This adds a new piece to an already complicated Deref coercions set.
+Reborrowable custom reference types are also relatively niche, though very
+useful.
 
-The best-case for compiler-injected conversion would be the
-[safe transmute project](https://rust-lang.github.io/rfcs/2835-project-safe-transmute.html)'s
-mechanisms, but those can only detect grievous errors like transmuting padding
-bytes to data. They would not detect logical errors, such as swapping two
-`usize` fields with one another (think swapping `length` and `cap` in `Vec`).
-Thus, as the `Reborrow` trait relies on compiler-injected transmutes, it is
-marked `unsafe`.
+The algorithm for the compiler to crunch through reborrowed vs copied fields is
+not too bad, but it's still a bit involved and if it were to be reproduced at
+each reborrowing coercion site then the performance penalty would probably be
+significant. Luckily, the results of the algorithm never change so it should be
+fairly easy to effectively cache the results.
 
-The second drawback of autoreborrowing is that it of course requires a generic
-implementation of reborrowing relying on the `Reborrow` trait in rustc. A
-version of reference wrapper autoreborrowing already exists in rustc for
-`Pin<&mut T>`, so the basic building blocks needed for autoreborrowing are
-already present. This drawback is thus considered to be minor.
+Aside from that, reborrowing is not too complex and rustc already has existing
+code for autoreborrowing `Pin<&mut T>`, which this would supersede.
 
 # Rationale and alternatives
 
